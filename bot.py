@@ -4,6 +4,10 @@ import json
 import os
 from datetime import datetime
 import asyncio
+import random
+import string
+from dotenv import load_dotenv
+import os
 
 # Configurações do bot
 intents = discord.Intents.default()
@@ -64,6 +68,49 @@ async def on_ready():
     except Exception as e:
         print(f'Erro ao sincronizar comandos: {e}')
 
+    # Registra views persistentes (corrige o erro!)
+    bot.add_view(TicketView())
+    bot.add_view(RoleRequestView())
+    bot.add_view(AdminPanelView())
+
+# ========== SISTEMA DE CARGO AUTOMÁTICO ==========
+
+@bot.event
+async def on_member_join(member):
+    """
+    Evento disparado quando um membro entra no servidor
+    Adiciona automaticamente o cargo inicial ao usuário
+    """
+    try:
+        # ID do cargo que será dado automaticamente
+        AUTO_ROLE_ID = 1390409777305092167
+        
+        # Busca o cargo no servidor
+        auto_role = member.guild.get_role(AUTO_ROLE_ID)
+        
+        if auto_role:
+            # Adiciona o cargo ao membro
+            await member.add_roles(auto_role, reason='Cargo automático ao entrar no servidor')
+            
+            # Log opcional - pode ser removido se não quiser spam no console
+            print(f'✅ Cargo automático adicionado para {member.name} ({member.id})')
+            
+        else:
+            # Log de erro se o cargo não for encontrado
+            print(f'❌ Cargo automático não encontrado! ID: {AUTO_ROLE_ID}')
+            
+    except discord.Forbidden:
+        # Bot não tem permissão para adicionar cargos
+        print(f'❌ Sem permissão para adicionar cargo automático para {member.name}')
+        
+    except discord.HTTPException as e:
+        # Erro HTTP do Discord
+        print(f'❌ Erro HTTP ao adicionar cargo automático: {e}')
+        
+    except Exception as e:
+        # Qualquer outro erro
+        print(f'❌ Erro inesperado ao adicionar cargo automático: {e}')
+
 # ========== SISTEMA DE TICKETS ==========
 
 class TicketView(discord.ui.View):
@@ -71,7 +118,7 @@ class TicketView(discord.ui.View):
         super().__init__(timeout=None)
     
     @discord.ui.button(label='🎫 Criar Ticket', style=discord.ButtonStyle.primary, custom_id='create_ticket')
-    async def create_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def create_ticket(self, interaction: discord.Interaction, _: discord.ui.Button):
         guild = interaction.guild
         user = interaction.user
         
@@ -149,7 +196,7 @@ class TicketControlView(discord.ui.View):
         self.ticket_id = ticket_id
     
     @discord.ui.button(label='🔒 Fechar Ticket', style=discord.ButtonStyle.danger, custom_id='close_ticket')
-    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def close_ticket(self, interaction: discord.Interaction, _: discord.ui.Button):
         # Verifica se é administrador
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message('Apenas administradores podem fechar tickets!', ephemeral=True)
@@ -197,14 +244,21 @@ class TicketControlView(discord.ui.View):
         await asyncio.sleep(5)
         await channel.delete()
 
-# ========== SISTEMA DE SOLICITAÇÃO DE CARGOS ==========
+# ========== SISTEMA DE SOLICITAÇÃO DE CARGOS COM CAPTCHA ==========
+
+import random
+import string
+import asyncio
+
+# Dicionário para armazenar captchas pendentes
+pending_captchas = {}
 
 class RoleRequestView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
     
     @discord.ui.button(label='📋 Solicitar Cargo', style=discord.ButtonStyle.secondary, custom_id='request_role')
-    async def request_role(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def request_role(self, interaction: discord.Interaction, _: discord.ui.Button):
         user = interaction.user
         guild = interaction.guild
         
@@ -224,9 +278,85 @@ class RoleRequestView(discord.ui.View):
             await interaction.response.send_message('Nenhum cargo disponível para solicitação!', ephemeral=True)
             return
         
-        # Cria modal para solicitação
-        modal = RoleRequestModal(available_roles)
-        await interaction.response.send_modal(modal)
+        # Cria view de captcha primeiro
+        captcha_view = CaptchaView(available_roles)
+        
+        embed = discord.Embed(
+            title='🔒 Verificação de Segurança',
+            description=f'**Selecione o código correto:** `{captcha_view.captcha_code}`\n\nClique no botão que corresponde ao código mostrado acima.',
+            color=0x830000
+        )
+        
+        await interaction.response.send_message(embed=embed, view=captcha_view, ephemeral=True)
+
+class CaptchaView(discord.ui.View):
+    def __init__(self, available_roles):
+        super().__init__(timeout=60)
+        self.available_roles = available_roles
+        
+        # Gera um código captcha simples (4 caracteres alfanuméricos)
+        self.captcha_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+        
+        # Gera opções incorretas para os botões
+        wrong_options = []
+        while len(wrong_options) < 3:
+            wrong_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+            if wrong_code != self.captcha_code and wrong_code not in wrong_options:
+                wrong_options.append(wrong_code)
+        
+        # Mistura as opções (1 correta + 3 incorretas)
+        all_options = [self.captcha_code] + wrong_options
+        random.shuffle(all_options)
+        
+        # Cria botões para cada opção
+        for i, option in enumerate(all_options):
+            button = discord.ui.Button(
+                label=option,
+                style=discord.ButtonStyle.secondary,
+                custom_id=f'captcha_option_{i}'
+            )
+            button.callback = self.create_callback(option)
+            self.add_item(button)
+    
+    def create_callback(self, option):
+        async def callback(interaction):
+            if option == self.captcha_code:
+                # Resposta correta - abre o modal diretamente
+                modal = RoleRequestModal(self.available_roles)
+                await interaction.response.send_modal(modal)
+                
+                # Cria uma task para apagar a mensagem após 5 segundos
+                async def delete_message():
+                    await asyncio.sleep(5)
+                    try:
+                        await interaction.delete_original_response()
+                    except:
+                        pass
+                
+                # Executa a task em segundo plano
+                asyncio.create_task(delete_message())
+                
+            else:
+                # Resposta incorreta
+                error_embed = discord.Embed(
+                    title='❌ Captcha Incorreto!',
+                    description='Código errado! Tente novamente clicando no botão "Solicitar Cargo".',
+                    color=0xff0000
+                )
+                await interaction.response.edit_message(embed=error_embed, view=None)
+                
+                # Apaga a mensagem após 5 segundos
+                await asyncio.sleep(5)
+                try:
+                    await interaction.delete_original_response()
+                except:
+                    pass
+        return callback
+    
+    async def on_timeout(self):
+        # Desabilita todos os botões quando o timeout é atingido
+        for item in self.children:
+            item.disabled = True
 
 class RoleRequestModal(discord.ui.Modal):
     def __init__(self, available_roles):
@@ -252,6 +382,16 @@ class RoleRequestModal(discord.ui.Modal):
             max_length=50
         )
         self.add_item(self.ingame_number)
+        
+        # Campo para nome no RP
+        self.rp_name = discord.ui.TextInput(
+            label='Nome No RP',
+            placeholder='Digite seu nome no roleplay...',
+            style=discord.TextStyle.short,
+            required=True,
+            max_length=80
+        )
+        self.add_item(self.rp_name)
         
         # Campo para cargo desejado
         roles_text = '\n'.join([f'{i+1}. {role.name}' for i, role in enumerate(available_roles)])
@@ -282,6 +422,7 @@ class RoleRequestModal(discord.ui.Modal):
                 'role_id': selected_role.id,
                 'recruiter_name': self.recruiter_name.value,
                 'ingame_number': self.ingame_number.value,
+                'rp_name': self.rp_name.value,
                 'timestamp': datetime.now().isoformat()
             }
             
@@ -290,7 +431,7 @@ class RoleRequestModal(discord.ui.Modal):
             if admin_channel:
                 embed = discord.Embed(
                     title='📋 Nova Solicitação de Cargo',
-                    description=f'**Usuário:** {user.mention}\n**Cargo solicitado:** {selected_role.mention}\n**Recrutador:** {self.recruiter_name.value}\n**Número Ingame:** {self.ingame_number.value}',
+                    description=f'**Usuário:** {user.mention}\n**Cargo solicitado:** {selected_role.mention}\n**Recrutador:** {self.recruiter_name.value}\n**Número Ingame:** {self.ingame_number.value}\n**Nome No RP:** {self.rp_name.value}',
                     color=0x830000
                 )
                 embed.set_thumbnail(url=user.avatar.url if user.avatar else None)
@@ -299,7 +440,7 @@ class RoleRequestModal(discord.ui.Modal):
                 view = RoleAdminView(request_id)
                 await admin_channel.send(embed=embed, view=view)
             
-            await interaction.response.send_message('Solicitação enviada com sucesso! Aguarde a aprovação dos administradores.', ephemeral=True)
+            await interaction.response.send_message('✅ Solicitação enviada com sucesso! Aguarde a aprovação dos administradores.', ephemeral=True)
             
         except ValueError:
             await interaction.response.send_message('Por favor, digite apenas o número do cargo!', ephemeral=True)
@@ -310,14 +451,14 @@ class RoleAdminView(discord.ui.View):
         self.request_id = request_id
     
     @discord.ui.button(label='✅ Aprovar', style=discord.ButtonStyle.success, custom_id='approve_role')
-    async def approve_role(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def approve_role(self, interaction: discord.Interaction, _: discord.ui.Button):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message('Apenas administradores podem aprovar solicitações!', ephemeral=True)
             return
         
         # Encontra a solicitação
         request_data = None
-        for user_id, data in role_requests.items():
+        for _, data in role_requests.items():
             if data['request_id'] == self.request_id:
                 request_data = data
                 break
@@ -334,7 +475,25 @@ class RoleAdminView(discord.ui.View):
             return
         
         try:
+            # Adiciona o cargo
             await user.add_roles(role, reason=f'Aprovado por {interaction.user}')
+            
+            # Remove o cargo inicial (ID: 1390409777305092167)
+            initial_role = interaction.guild.get_role(1390409777305092167)
+            if initial_role and initial_role in user.roles:
+                try:
+                    await user.remove_roles(initial_role, reason=f'Cargo inicial removido após aprovação por {interaction.user}')
+                except discord.Forbidden:
+                    # Se não conseguir remover, continua com o processo
+                    pass
+            
+            # Renomeia o usuário com o formato: MEM | NOME DO RP
+            new_nickname = f"MEM | {request_data['rp_name']}"
+            try:
+                await user.edit(nick=new_nickname, reason=f'Aprovação de cargo - {interaction.user}')
+            except discord.Forbidden:
+                # Se não conseguir renomear, continua com o processo
+                pass
             
             # Remove solicitação
             del role_requests[request_data['user_id']]
@@ -342,7 +501,7 @@ class RoleAdminView(discord.ui.View):
             # Atualiza mensagem
             embed = discord.Embed(
                 title='✅ Solicitação Aprovada',
-                description=f'**Usuário:** {user.mention}\n**Cargo:** {role.mention}\n**Recrutador:** {request_data["recruiter_name"]}\n**Número Ingame:** {request_data["ingame_number"]}\n**Aprovado por:** {interaction.user.mention}',
+                description=f'**Usuário:** {user.mention}\n**Cargo:** {role.mention}\n**Recrutador:** {request_data["recruiter_name"]}\n**Número Ingame:** {request_data["ingame_number"]}\n**Nome No RP:** {request_data["rp_name"]}\n**Novo Nickname:** {new_nickname}\n**Aprovado por:** {interaction.user.mention}',
                 color=0x00ff00
             )
             
@@ -350,7 +509,7 @@ class RoleAdminView(discord.ui.View):
             
             # Notifica usuário
             try:
-                await user.send(f'Sua solicitação para o cargo **{role.name}** foi aprovada!')
+                await user.send(f'Sua solicitação para o cargo **{role.name}** foi aprovada!\nSeu nickname foi alterado para: **{new_nickname}**')
             except:
                 pass
                 
@@ -358,7 +517,7 @@ class RoleAdminView(discord.ui.View):
             await interaction.response.send_message('Não tenho permissão para adicionar este cargo!', ephemeral=True)
     
     @discord.ui.button(label='❌ Reprovar', style=discord.ButtonStyle.danger, custom_id='deny_role')
-    async def deny_role(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def deny_role(self, interaction: discord.Interaction, _: discord.ui.Button):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message('Apenas administradores podem reprovar solicitações!', ephemeral=True)
             return
@@ -383,7 +542,7 @@ class RoleAdminView(discord.ui.View):
         # Atualiza mensagem
         embed = discord.Embed(
             title='❌ Solicitação Reprovada',
-            description=f'**Usuário:** {user.mention if user else "Usuário não encontrado"}\n**Cargo:** {role.mention if role else "Cargo não encontrado"}\n**Recrutador:** {request_data.get("recruiter_name", "N/A")}\n**Número Ingame:** {request_data.get("ingame_number", "N/A")}\n**Reprovado por:** {interaction.user.mention}',
+            description=f'**Usuário:** {user.mention if user else "Usuário não encontrado"}\n**Cargo:** {role.mention if role else "Cargo não encontrado"}\n**Recrutador:** {request_data.get("recruiter_name", "N/A")}\n**Número Ingame:** {request_data.get("ingame_number", "N/A")}\n**Nome No RP:** {request_data.get("rp_name", "N/A")}\n**Reprovado por:** {interaction.user.mention}',
             color=0xff0000
         )
         
@@ -449,7 +608,6 @@ async def config_command(interaction: discord.Interaction):
             embed.add_field(name=key, value=str(value), inline=True)
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
-
 
 # ========== SISTEMA DE PAINEL DE ADMINISTRAÇÃO ==========
 
@@ -796,39 +954,68 @@ class EmbedModal(discord.ui.Modal):
 
 class AdminPanelView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=None)
-    
-    @discord.ui.button(label="Banimento", style=discord.ButtonStyle.danger, emoji="🔨")
-    async def ban_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        super().__init__(timeout=None)  # Necessário para persistência
+
+    @discord.ui.button(
+        label="Banimento",
+        style=discord.ButtonStyle.danger,
+        emoji="🔨",
+        custom_id="adminpanel_ban_button"
+    )
+    async def ban_button(self, interaction: discord.Interaction, _: discord.ui.Button):
         if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ Você não tem permissão para usar esta funcionalidade!", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ Você não tem permissão para usar esta funcionalidade!", ephemeral=True
+            )
             return
-        
+
         await interaction.response.send_modal(BanModal())
-    
-    @discord.ui.button(label="Cargos", style=discord.ButtonStyle.primary, emoji="👑")
-    async def roles_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+
+    @discord.ui.button(
+        label="Cargos",
+        style=discord.ButtonStyle.primary,
+        emoji="👑",
+        custom_id="adminpanel_roles_button"
+    )
+    async def roles_button(self, interaction: discord.Interaction, _: discord.ui.Button):
         if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ Você não tem permissão para usar esta funcionalidade!", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ Você não tem permissão para usar esta funcionalidade!", ephemeral=True
+            )
             return
-        
+
         await interaction.response.send_modal(RoleModal())
-    
-    @discord.ui.button(label="Advertências", style=discord.ButtonStyle.secondary, emoji="⚠️")
-    async def warnings_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+
+    @discord.ui.button(
+        label="Advertências",
+        style=discord.ButtonStyle.secondary,
+        emoji="⚠️",
+        custom_id="adminpanel_warnings_button"
+    )
+    async def warnings_button(self, interaction: discord.Interaction, _: discord.ui.Button):
         if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ Você não tem permissão para usar esta funcionalidade!", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ Você não tem permissão para usar esta funcionalidade!", ephemeral=True
+            )
             return
-        
+
         await interaction.response.send_modal(WarningModal())
-    
-    @discord.ui.button(label="Embed", style=discord.ButtonStyle.success, emoji="📝")
-    async def embed_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+
+    @discord.ui.button(
+        label="Embed",
+        style=discord.ButtonStyle.success,
+        emoji="📝",
+        custom_id="adminpanel_embed_button"
+    )
+    async def embed_button(self, interaction: discord.Interaction, _: discord.ui.Button):
         if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ Você não tem permissão para usar esta funcionalidade!", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ Você não tem permissão para usar esta funcionalidade!", ephemeral=True
+            )
             return
-        
+
         await interaction.response.send_modal(EmbedModal())
+
 
 # ========== COMANDOS ==========
 
@@ -975,6 +1162,15 @@ async def on_message(message):
 # ========== INICIALIZAÇÃO ==========
 
 if __name__ == '__main__':
+    from dotenv import load_dotenv
+    import os
+
+    load_dotenv()  # Carrega as variáveis do .env
+
+    TOKEN = os.getenv("DISCORD_TOKEN")  # Lê o token do .env
+
+    if not TOKEN:
+        raise RuntimeError("⚠️  DISCORD_TOKEN não encontrado no .env!")
+
     print("🚀 Iniciando bot...")
-    # SUBSTITUA 'SEU_TOKEN_AQUI' pelo token real do seu bot
-    bot.run('MTM5MDQxNzYyNTQzNTM0MDkyMw.GnyBB9.NVegqSOBlCg6FlyXCjf7z3tGMMcSYDE88pTdsY')
+    bot.run(TOKEN)
